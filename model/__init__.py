@@ -200,21 +200,13 @@ def ddim_sampler(x_mod, scorenet, cond=None, final_only=False, denoise=True, sub
 @torch.no_grad()
 def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, denoise=True, subsample_steps=None,
                  same_noise=False, noise_val=None, frac_steps=None, verbose=False, log=False, clip_before=True, 
-                 t_min=-1, gamma=False, **kwargs):
-    """
-    Final Robust DDPM Sampler.
-    Compatible with Linear Schedule.
-    Uses Predicted x0 Clipping and Posterior Variance.
-    """
-    net = scorenet.module if hasattr(scorenet, 'module') else scorenet
+                 t_min=-1, gamma=False, temperature=1.0, **kwargs):
     
-    # Load Schedule
+    net = scorenet.module if hasattr(scorenet, 'module') else scorenet
     betas = net.betas
     alphas_cumprod = net.alphas
     alphas_cumprod_prev = net.alphas_prev
     num_timesteps = len(betas)
-    
-    # Reverse Steps [T-1, ..., 0]
     steps = list(range(num_timesteps))[::-1]
     
     if subsample_steps is not None:
@@ -225,67 +217,107 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
         noise_val = x_mod.detach().clone()
 
     images = []
+    
+    # --- 1. 显式维度管理 ---
+    # x_mod 初始传入的是 Future (预测目标)
+    n_future = x_mod.shape[1] 
+    n_past = cond.shape[1] if cond is not None else 0
+    
+    # 构造全序列 [B, Future+Past, H, W]
+    if cond is not None:
+        x_cond_noise = torch.randn_like(cond)
+        # 拼接顺序：[Future, Past]
+        x_mod = torch.cat([x_mod, x_cond_noise], dim=1)
+        
+        # 记录 Ground Truth Past (Clean)
+        gt_cond = cond 
+        # 传给 scorenet 的 cond 设为 None (因为已经拼在 input 里了)
+        cond = None 
+    else:
+        gt_cond = None
+
     scorenet_fn = partial(scorenet, cond=cond)
 
     for i, step_idx in enumerate(steps):
         t = torch.full((x_mod.shape[0],), step_idx, device=x_mod.device, dtype=torch.long)
-
-        # Current Step Params
+        
+        # Params
         beta_t = betas[step_idx]
         alpha_cumprod_t = alphas_cumprod[step_idx]
         alpha_cumprod_prev_t = alphas_cumprod_prev[step_idx]
         alpha_t = alpha_cumprod_t / alpha_cumprod_prev_t
 
-        # Predict Noise (Epsilon)
-        grad = scorenet_fn(x_mod, t)
-        if grad.shape[1] != x_mod.shape[1]:
-            grad = grad[:, :x_mod.shape[1], ...]
-
-        # --- 1. Predict x0 ---
-        # x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
-        sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
-        sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod_t)
-        
-        # Stability check
-        if sqrt_alpha_cumprod_t < 1e-5: sqrt_alpha_cumprod_t = 1e-5
+        # --- 2. Replacement (Inpainting) Step ---
+        if gt_cond is not None:
+            # 计算当前步对应的 GT Noisy Past
+            # q(x_t | x_0) = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * eps
+            noise = torch.randn_like(gt_cond)
             
-        pred_x0 = (x_mod - sqrt_one_minus_alpha_cumprod_t * grad) / sqrt_alpha_cumprod_t
+            # 注意: alpha_cumprod_t 是 scalar，直接乘可能会导致 batch 维度广播问题
+            # 显式 reshape alpha 以确保安全
+            alpha_t_shaped = alpha_cumprod_t.view(-1, 1, 1, 1)
+            
+            noisy_cond_t = torch.sqrt(alpha_t_shaped) * gt_cond + torch.sqrt(1 - alpha_t_shaped) * noise
+            
+            # 显式切片：替换后半部分 (Past)
+            # x_mod: [0...n_future-1] 是 Future
+            # x_mod: [n_future...end] 是 Past
+            
+            # Debug check (只在第一步检查)
+            if i == 0:
+                target_slice_shape = x_mod[:, n_future:].shape
+                source_shape = noisy_cond_t.shape
+                if target_slice_shape != source_shape:
+                    print(f"ERROR: Shape mismatch in Replacement!")
+                    print(f"Target slice (x_mod[:, {n_future}:]): {target_slice_shape}")
+                    print(f"Source (noisy_cond_t): {source_shape}")
+                    raise RuntimeError("Dimension mismatch in ddpm_sampler replacement step")
+
+            x_mod[:, n_future:] = noisy_cond_t
+
+        # Predict
+        grad = scorenet_fn(x_mod, t)
         
-        # --- 2. Clip Predicted x0 ---
+        # Predict x0
+        # x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+        
+        # 再次确保 alpha 维度安全
+        sqrt_recip_alpha_bar = torch.sqrt(1. / alpha_cumprod_t).view(-1, 1, 1, 1)
+        sqrt_recip_m1_alpha_bar = torch.sqrt(1. / alpha_cumprod_t - 1.).view(-1, 1, 1, 1)
+        
+        pred_x0 = sqrt_recip_alpha_bar * x_mod - sqrt_recip_m1_alpha_bar * grad
+        
         if clip_before:
             pred_x0 = pred_x0.clamp(-1., 1.)
             
-        # --- 3. Compute Mean (Posterior Mean) ---
+        # Compute Mean (Posterior Mean)
         # mu_t = coeff1 * x0 + coeff2 * xt
-        coeff_x0 = (beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)
-        coeff_xt = ((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)
+        
+        coeff_x0 = ((beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
+        coeff_xt = (((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
         
         mean = coeff_x0 * pred_x0 + coeff_xt * x_mod
 
-        # --- 4. Add Noise (Posterior Variance) ---
+        # Add Noise (Posterior Variance)
         if step_idx > 0:
             if same_noise:
                 noise = noise_val
             else:
-                noise = torch.randn_like(x_mod)
+                noise = torch.randn_like(x_mod) * temperature
             
-            # Posterior Variance: sigma^2 = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
-            # This naturally goes to 0 as step_idx -> 0
             sigma_t_sq = ((1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t)) * beta_t
-            sigma_t = torch.sqrt(sigma_t_sq + 1e-10)
+            sigma_t = torch.sqrt(sigma_t_sq + 1e-10).view(-1, 1, 1, 1)
             
             x_mod = mean + sigma_t * noise
         else:
             x_mod = mean
-
-        if not final_only:
-            images.append(x_mod.to('cpu'))
             
         if verbose and i % 100 == 0:
             print(f"Sampling step {step_idx}...")
 
+    # 返回时，只返回预测部分 (Future)
     if final_only:
-        return x_mod.unsqueeze(0)
+        return x_mod[:, :n_future].unsqueeze(0)
     else:
         return torch.stack(images)
 

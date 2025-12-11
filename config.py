@@ -63,7 +63,10 @@ class Config:
         self.optim.beta1 = 0.9
         self.optim.amsgrad = False
         self.optim.eps = 1e-8
-        self.optim.grad_clip = 1.0
+        # 原作者使用 Sum Loss，梯度值会非常大。
+        # 必须将 grad_clip 设为极大值 (相当于禁用) 或者根据 sum 的量级调整。
+        # 建议设为 <0 (禁用) 或 10000.0
+        self.optim.grad_clip = -1.0
         self.optim.warmup = 5000
 
         # Sampling Config

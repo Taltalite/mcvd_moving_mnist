@@ -216,7 +216,8 @@ def main():
                 )
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(scorenet.parameters(), config.optim.grad_clip)
+                if config.optim.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(scorenet.parameters(), config.optim.grad_clip)
                 optimizer.step()
                 ema_helper.update(scorenet)
                 

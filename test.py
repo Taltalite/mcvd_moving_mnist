@@ -129,6 +129,8 @@ def main():
             x_init, 
             scorenet, 
             cond=cond_tensor, 
+            subsample_steps=None, # default 1000
+            temperature=1.0,     # 尝试 0.7 或 0.5
             final_only=True, 
             denoise=False,      # 必须 False
             clip_before=True,   # 必须 True (x0 clipping)
