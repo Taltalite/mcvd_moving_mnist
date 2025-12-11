@@ -29,3 +29,8 @@ uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/log
  --output_dir ./outputs/mnist_experiment_vis_debug_linear/ \
  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
  --num_samples 1
+
+uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_linear/ckpt_epoch_100.pt \
+ --output_dir ./outputs/mnist_experiment_vis_debug_linear_2/ \
+ --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
+ --num_samples 2
