@@ -113,13 +113,17 @@ def main():
         
         # sampler args: x_mod (noise), scorenet, cond (condition), ...
         # 注意: ddpm_sampler 的 cond_mask 参数默认为 None，表示全部 conditioned，这正是我们在推理时想要的
+        # 必须设置 denoise=False！
+        # 因为 DDPM 采样循环已经包含了去噪到 t=0 的过程。
+        # 额外的 denoise 步骤会使用 t=999 的参数破坏生成的图像。
         generated_flat = ddpm_sampler(
             x_init, 
             scorenet, 
             cond=cond_tensor, 
             final_only=True, 
-            denoise=True,
-            subsample_steps=None, # Use full steps (1000) for best quality
+            denoise=False,  # <--- 修改这里为 False
+            clip_before=True,
+            subsample_steps=None, 
             verbose=False
         )
         # generated_flat shape: [1, 10*C, H, W]

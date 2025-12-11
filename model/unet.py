@@ -338,51 +338,38 @@ class UNet_DDPM(nn.Module):
         self.unet = UNet(config)
 
         self.schedule = getattr(config.model, 'sigma_dist', 'linear')
+        
+        # --- STANDARD LINEAR SCHEDULE INIT ---
         if self.schedule == 'linear':
-            # 1. 获取 betas (从小到大)
+            # 1. Linear Beta Schedule
             self.register_buffer('betas', get_sigmas(config))
             
-            # 2. 计算 alphas (1 - beta)
+            # 2. Alphas
             alphas = 1. - self.betas
             
-            # 3. 计算 cumprod (累乘)
-            # 注意：不要使用 flip！我们需要它随 t 增加而变小
+            # 3. Cumprod
             alphas_cumprod = torch.cumprod(alphas, dim=0)
             self.register_buffer('alphas', alphas_cumprod)
             
-            # 4. 计算 alphas_prev (向右移一位，t=0时设为1.0)
+            # 4. Alphas Prev (pad with 1.0 at beginning)
             self.register_buffer('alphas_prev', torch.cat([torch.tensor([1.0]).to(self.alphas), self.alphas[:-1]]))
+            
         elif self.schedule == 'cosine':
-            # === 这一段是标准的 Improved DDPM Cosine Schedule 实现 ===
-            T = config.model.num_classes # 也就是 timesteps, 通常是 1000
-            
-            # 计算 s (offset)
+            # ... (Cosine logic kept for backup, but won't be used) ...
+            T = config.model.num_classes
             s = 0.008
-            
-            # 生成 t = 0 到 T 的步长
             steps = torch.arange(T + 1, dtype=torch.float32, device=config.device) / T
-            
-            # 计算 f(t) = cos(...)²
-            # 这是一个从 1 缓慢下降到 0 的曲线
             alphas_cumprod = torch.cos(((steps + s) / (1 + s)) * math.pi * 0.5) ** 2
             alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-            
-            # 计算 betas = 1 - (alpha_bar_t / alpha_bar_{t-1})
             betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            
-            # 裁剪 betas 以防数值不稳定 (最大 0.999)
             betas = torch.clip(betas, 0, 0.999)
-            
             self.register_buffer('betas', betas)
-            
-            # 重新根据 betas 计算标准的 alphas 和 alphas_cumprod 
-            # (虽然上面算过一次，但这样能保证一致性)
             alphas = 1. - self.betas
             alphas_cumprod = torch.cumprod(alphas, dim=0)
             self.register_buffer('alphas', alphas_cumprod)
-            
-            # 计算 alphas_prev (右移一位，t=0时补1.0)
             self.register_buffer('alphas_prev', torch.cat([torch.tensor([1.0]).to(self.alphas), self.alphas[:-1]]))
+            
+            
         self.gamma = getattr(config.model, 'gamma', False)
         if self.gamma:
             self.theta_0 = 0.001

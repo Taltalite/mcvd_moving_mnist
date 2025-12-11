@@ -14,23 +14,17 @@ from . import pndm
 
 
 def get_sigmas(config):
-
     T = getattr(config.model, 'num_classes')
-
     if config.model.sigma_dist == 'geometric':
-        return torch.logspace(np.log10(config.model.sigma_begin), np.log10(config.model.sigma_end),
-                              T).to(config.device)
-
+        return torch.logspace(np.log10(config.model.sigma_begin), np.log10(config.model.sigma_end), T).to(config.device)
     elif config.model.sigma_dist == 'linear':
-        return torch.linspace(config.model.sigma_begin, config.model.sigma_end,
-                              T).to(config.device)
-
+        return torch.linspace(config.model.sigma_begin, config.model.sigma_end, T).to(config.device)
     elif config.model.sigma_dist == 'cosine':
+        # ... (keep existing cosine logic) ...
         t = torch.linspace(T, 0, T+1)/T
         s = 0.008
         f = torch.cos((t + s)/(1 + s) * np.pi/2)**2
         return f[:-1]/f[-1]
-
     else:
         raise NotImplementedError('sigma distribution not supported')
 
@@ -208,103 +202,81 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
                  same_noise=False, noise_val=None, frac_steps=None, verbose=False, log=False, clip_before=True, 
                  t_min=-1, gamma=False, **kwargs):
     """
-    修正后的 DDPM 采样器：
-    1. 强制使用 net.alphas/betas (适配 Cosine)
-    2. 修正了循环顺序 (从 T 到 0)
-    3. 简化了复杂的索引逻辑，确保数值稳定
+    Final Robust DDPM Sampler.
+    Compatible with Linear Schedule.
+    Uses Predicted x0 Clipping and Posterior Variance.
     """
     net = scorenet.module if hasattr(scorenet, 'module') else scorenet
     
-    # 1. 直接信任模型内部的 Schedule (这是我们之前修改 UNet 的成果)
-    # 不要取消注释那些 schedule == 'linear' 的代码，否则会覆盖掉正确的参数
+    # Load Schedule
     betas = net.betas
     alphas_cumprod = net.alphas
     alphas_cumprod_prev = net.alphas_prev
-    
     num_timesteps = len(betas)
     
-    # 2. 生成时间步 (关键修正：必须是倒序！)
-    # 比如 [999, 998, ... 0]
+    # Reverse Steps [T-1, ..., 0]
     steps = list(range(num_timesteps))[::-1]
     
-    # 如果需要跳步采样 (Subsample)，在这里处理
     if subsample_steps is not None:
-        # 简单均匀采样，例如 1000步 -> 100步
         skip = num_timesteps // subsample_steps
-        steps = steps[::skip] # 切片后依然保持倒序
+        steps = steps[::skip]
 
     if same_noise and noise_val is None:
         noise_val = x_mod.detach().clone()
 
     images = []
-    # 绑定 condition
     scorenet_fn = partial(scorenet, cond=cond)
 
-    # 在循环开始前打印 Schedule 信息
-    print(f"\n[DEBUG TEST Sampler Init]")
-    print(f"  Alphas[0]: {alphas_cumprod[0].item():.6f}")
-    print(f"  Alphas[-1]: {alphas_cumprod[-1].item():.6f}") # 必须和 Train 时完全一致！
-    print(f"  Alphas len: {len(alphas_cumprod)}")
-    
-    # === 开始反向扩散循环 ===
-    # L = len(steps)
     for i, step_idx in enumerate(steps):
-        # step_idx 是真实的时间步 t (例如 999)
-        # i 是循环计数器 (例如 0)
-        
         t = torch.full((x_mod.shape[0],), step_idx, device=x_mod.device, dtype=torch.long)
 
-        # 3. 获取当前时间步的参数
-        # 注意：这里必须用 step_idx 来索引，而不是 i
+        # Current Step Params
         beta_t = betas[step_idx]
         alpha_cumprod_t = alphas_cumprod[step_idx]
         alpha_cumprod_prev_t = alphas_cumprod_prev[step_idx]
-        
-        # 计算 alpha_t (当前步的 alpha)
         alpha_t = alpha_cumprod_t / alpha_cumprod_prev_t
 
-        # 4. 模型预测噪声
-        # 我们传入 step_idx 作为 labels
+        # Predict Noise (Epsilon)
         grad = scorenet_fn(x_mod, t)
-
-        # --- DEBUG INSERT START ---
-        # 只打印第一步(999)，中间一步(500)，和最后一步(0)
-        if step_idx in [999, 500, 0]:
-            print(f"\n[DEBUG TEST Step {step_idx}]")
-            print(f"  x_mod (Noisy Input) std: {x_mod.std().item():.4f}, min: {x_mod.min().item():.3f}, max: {x_mod.max().item():.3f}")
-            print(f"  Alpha_bar_t: {alpha_cumprod_t.item():.6f}")
-            print(f"  Grad (Pred Noise) std: {grad.std().item():.4f} (Should be ~1.0)")
-            print(f"  Grad mean: {grad.mean().item():.4f}")
-        # --- DEBUG INSERT END ---
-        
-        # 兼容性处理：如果 UNet 输出了 [Target, Cond]，只取 Target
         if grad.shape[1] != x_mod.shape[1]:
             grad = grad[:, :x_mod.shape[1], ...]
 
-        # 5. 计算 x_{t-1}
-        # 公式: x_{t-1} = 1/sqrt(alpha_t) * (x_t - (beta_t / sqrt(1-bar_alpha_t)) * eps)
-        coeff = beta_t / torch.sqrt(1 - alpha_cumprod_t)
-        mean = (1 / torch.sqrt(alpha_t)) * (x_mod - coeff * grad)
+        # --- 1. Predict x0 ---
+        # x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+        sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1 - alpha_cumprod_t)
+        sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod_t)
+        
+        # Stability check
+        if sqrt_alpha_cumprod_t < 1e-5: sqrt_alpha_cumprod_t = 1e-5
+            
+        pred_x0 = (x_mod - sqrt_one_minus_alpha_cumprod_t * grad) / sqrt_alpha_cumprod_t
+        
+        # --- 2. Clip Predicted x0 ---
+        if clip_before:
+            pred_x0 = pred_x0.clamp(-1., 1.)
+            
+        # --- 3. Compute Mean (Posterior Mean) ---
+        # mu_t = coeff1 * x0 + coeff2 * xt
+        coeff_x0 = (beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)
+        coeff_xt = ((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)
+        
+        mean = coeff_x0 * pred_x0 + coeff_xt * x_mod
 
-        # 6. 添加方差 (Noise)
-        # 只有当 t > 0 时才加噪声
+        # --- 4. Add Noise (Posterior Variance) ---
         if step_idx > 0:
             if same_noise:
                 noise = noise_val
             else:
                 noise = torch.randn_like(x_mod)
             
-            # sigma_t 计算
-            # 标准 DDPM 使用 sigma = sqrt(beta)
-            sigma_t = torch.sqrt(beta_t)
+            # Posterior Variance: sigma^2 = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
+            # This naturally goes to 0 as step_idx -> 0
+            sigma_t_sq = ((1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t)) * beta_t
+            sigma_t = torch.sqrt(sigma_t_sq + 1e-10)
             
             x_mod = mean + sigma_t * noise
         else:
             x_mod = mean
-
-        # 裁剪 (Clip)，防止像素溢出导致灰度失真
-        if clip_before:
-            x_mod = x_mod.clamp(-1, 1)
 
         if not final_only:
             images.append(x_mod.to('cpu'))
