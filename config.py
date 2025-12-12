@@ -32,7 +32,7 @@ class Config:
         self.model.num_classes = 1000 
         
         # --- CRITICAL CHANGE: LINEAR SCHEDULE ---
-        self.model.sigma_dist = 'linear'  # 改为 linear
+        self.model.sigma_dist = 'cosine'  # 改为 linear
         self.model.sigma_begin = 1e-4     # 标准 DDPM 参数
         self.model.sigma_end = 0.02       # 标准 DDPM 参数
         # ----------------------------------------
@@ -47,8 +47,8 @@ class Config:
         # Training Config
         self.training = type('TrainingConfig', (), {})()
         self.training.batch_size = 64
-        self.training.n_epochs = 200
-        self.training.n_iters = 200000
+        self.training.n_epochs = 400
+        self.training.n_iters = 400000
         self.training.snapshot_freq = 5000
         self.training.val_freq = 1000
         self.training.log_freq = 100
@@ -63,10 +63,8 @@ class Config:
         self.optim.beta1 = 0.9
         self.optim.amsgrad = False
         self.optim.eps = 1e-8
-        # 原作者使用 Sum Loss，梯度值会非常大。
-        # 必须将 grad_clip 设为极大值 (相当于禁用) 或者根据 sum 的量级调整。
-        # 建议设为 <0 (禁用) 或 10000.0
-        self.optim.grad_clip = -1.0
+
+        self.optim.grad_clip = 1.0
         self.optim.warmup = 5000
 
         # Sampling Config

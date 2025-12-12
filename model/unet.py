@@ -296,8 +296,11 @@ class UNet(nn.Module):
             n_pred_channels = self.num_frames * self.n_channels
             n_cond_channels = self.num_frames_cond * self.n_channels
             
-            output, _ = torch.split(output, [n_pred_channels, n_cond_channels], dim=1)
-
+            # 因为输入是 [Cond, Target]，输出也是 [Cond, Target]
+            # 所以我们 split 为 [n_cond, n_pred]
+            # 我们只想要后半部分 (Target/Prediction)
+            _, output = torch.split(output, [n_cond_channels, n_pred_channels], dim=1)
+            
         return output
 
 
@@ -339,38 +342,19 @@ class UNet_DDPM(nn.Module):
 
         self.schedule = getattr(config.model, 'sigma_dist', 'linear')
         
-        # --- STANDARD LINEAR SCHEDULE INIT ---
-        if self.schedule == 'linear':
-            # 1. Linear Beta Schedule
-            self.register_buffer('betas', get_sigmas(config))
-            
-            # 2. Alphas
-            alphas = 1. - self.betas
-            
-            # 3. Cumprod
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            self.register_buffer('alphas', alphas_cumprod)
-            
-            # 4. Alphas Prev (pad with 1.0 at beginning)
-            self.register_buffer('alphas_prev', torch.cat([torch.tensor([1.0]).to(self.alphas), self.alphas[:-1]]))
-            
-        elif self.schedule == 'cosine':
-            # ... (Cosine logic kept for backup, but won't be used) ...
-            T = config.model.num_classes
-            s = 0.008
-            steps = torch.arange(T + 1, dtype=torch.float32, device=config.device) / T
-            alphas_cumprod = torch.cos(((steps + s) / (1 + s)) * math.pi * 0.5) ** 2
-            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            betas = torch.clip(betas, 0, 0.999)
-            self.register_buffer('betas', betas)
-            alphas = 1. - self.betas
-            alphas_cumprod = torch.cumprod(alphas, dim=0)
-            self.register_buffer('alphas', alphas_cumprod)
-            self.register_buffer('alphas_prev', torch.cat([torch.tensor([1.0]).to(self.alphas), self.alphas[:-1]]))
-            
-            
+        # 1. 直接获取 betas (get_sigmas 已经处理了 linear/cosine 的逻辑)
+        self.register_buffer('betas', get_sigmas(config))
+        
+        # 2. 计算 Alphas
+        alphas = 1. - self.betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer('alphas', alphas_cumprod)
+        
+        # 3. 计算 Alphas Prev
+        self.register_buffer('alphas_prev', torch.cat([torch.tensor([1.0]).to(self.alphas), self.alphas[:-1]]))
+    
         self.gamma = getattr(config.model, 'gamma', False)
+        
         if self.gamma:
             self.theta_0 = 0.001
             self.register_buffer('k', self.betas/(self.alphas*(self.theta_0 ** 2)))  # large to small, doesn't match paper, match code instead

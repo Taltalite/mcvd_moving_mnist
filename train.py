@@ -44,7 +44,9 @@ def get_optimizer(config, parameters):
 def warmup_lr(optimizer, step, warmup, max_lr):
     if step < warmup:
         lr = max_lr * float(step) / warmup
-        for param_group in optimizer.param_groups:
+    else:
+        lr = max_lr
+    for param_group in optimizer.param_groups:
             param_group['lr'] = lr
     return optimizer.param_groups[0]['lr']
 
@@ -143,9 +145,6 @@ def validate(scorenet, val_loader, config):
 def main():
     args = parse_args()
     config = Config()
-    # 覆盖 Config 参数
-    config.training.batch_size = args.batch_size
-    config.data.num_workers = args.num_workers
     
     os.makedirs(args.log_dir, exist_ok=True)
     

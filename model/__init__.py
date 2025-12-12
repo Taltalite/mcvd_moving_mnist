@@ -20,11 +20,13 @@ def get_sigmas(config):
     elif config.model.sigma_dist == 'linear':
         return torch.linspace(config.model.sigma_begin, config.model.sigma_end, T).to(config.device)
     elif config.model.sigma_dist == 'cosine':
-        # ... (keep existing cosine logic) ...
-        t = torch.linspace(T, 0, T+1)/T
+        # Cosine Schedule 通常是直接计算 alphas_cumprod，然后反推 betas
+        t = torch.arange(T + 1, dtype=torch.float64, device=config.device) / T
         s = 0.008
-        f = torch.cos((t + s)/(1 + s) * np.pi/2)**2
-        return f[:-1]/f[-1]
+        f = torch.cos(((t + s) / (1 + s)) * np.pi / 2) ** 2
+        alphas_cumprod = f / f[0]
+        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+        return torch.clip(betas, 0, 0.999).float() # 必须返回 betas!
     else:
         raise NotImplementedError('sigma distribution not supported')
 
@@ -35,31 +37,16 @@ def FPNDM_sampler(x_mod, scorenet, cond=None, final_only=False, denoise=True, su
 
     net = scorenet.module if hasattr(scorenet, 'module') else scorenet
 
-    # schedule = getattr(config.model, 'sigma_dist', 'linear')
-    # if schedule == 'linear':
-    #     betas = get_sigmas(config)
-    #     alphas = torch.cumprod(1 - betas.flip(0), 0).flip(0)
-    #     alphas_prev = torch.cat([alphas[1:], torch.tensor([1.0]).to(alphas)])
-    # elif schedule == 'cosine':
-    #     alphas = get_sigmas(config)
-    #     alphas_prev = torch.cat([alphas[1:], torch.tensor([1.0]).to(alphas)])
-    #     betas = (1 - alphas/alphas_prev).clip_(0, 0.999)
     alphas, alphas_prev, betas = net.alphas, net.alphas_prev, net.betas
     steps = np.arange(len(betas))
 
     net_type = getattr(net, 'type') if isinstance(getattr(net, 'type'), str) else 'v1'
 
     alphas_old = alphas.flip(0)
-    
-    # New ts (see https://github.com/ermongroup/ddim/blob/main/runners/diffusion.py)
     skip = len(alphas) // subsample_steps
     steps = range(0, len(alphas), skip)
     steps_next = [-1] + list(steps[:-1])
 
-    #steps_next = list(steps[1:]) + [steps[-1] + 1]
-    #print(steps)
-    #print(steps_next)
-    #alphas_old = torch.cat([alphas_old, torch.tensor([1.0]).to(alphas)])
 
     steps = torch.tensor(steps, device=alphas.device)
     steps_next = torch.tensor(steps_next, device=alphas.device)
@@ -98,24 +85,13 @@ def ddim_sampler(x_mod, scorenet, cond=None, final_only=False, denoise=True, sub
                  verbose=False, log=True, clip_before=True, t_min=-1, gamma=False, **kwargs):
 
     net = scorenet.module if hasattr(scorenet, 'module') else scorenet
-
-    # schedule = getattr(config.model, 'sigma_dist', 'linear')
-    # if schedule == 'linear':
-    #     betas = get_sigmas(config)
-    #     alphas = torch.cumprod(1 - betas.flip(0), 0).flip(0)
-    #     alphas_prev = torch.cat([alphas[1:], torch.tensor([1.0]).to(alphas)])
-    # elif schedule == 'cosine':
-    #     alphas = get_sigmas(config)
-    #     alphas_prev = torch.cat([alphas[1:], torch.tensor([1.0]).to(alphas)])
-    #     betas = (1 - alphas/alphas_prev).clip_(0, 0.999)
     alphas, alphas_prev, betas = net.alphas, net.alphas_prev, net.betas
     if gamma:
         ks_cum, thetas = net.k_cum, net.theta_t
     steps = np.arange(len(betas))
 
     net_type = getattr(net, 'type') if isinstance(getattr(net, 'type'), str) else 'v1'
-
-    # New ts (see https://github.com/ermongroup/ddim/blob/main/runners/diffusion.py)
+    
     if subsample_steps is not None:
         if subsample_steps < len(alphas):
             skip = len(alphas) // subsample_steps
@@ -218,21 +194,18 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
 
     images = []
     
-    # --- 1. 显式维度管理 ---
-    # x_mod 初始传入的是 Future (预测目标)
+    # --- 维度获取 ---
+    # x_mod 传入的是 x_init (Target/Future), shape [B, 10, H, W]
     n_future = x_mod.shape[1] 
     n_past = cond.shape[1] if cond is not None else 0
     
-    # 构造全序列 [B, Future+Past, H, W]
+    # --- 修正逻辑 1: 拼接顺序 [Past, Future] ---
     if cond is not None:
         x_cond_noise = torch.randn_like(cond)
-        # 拼接顺序：[Future, Past]
-        x_mod = torch.cat([x_mod, x_cond_noise], dim=1)
-        
-        # 记录 Ground Truth Past (Clean)
+        # 这里的 x_mod 变成了 [B, 15, H, W]，前5帧是noise(cond)，后10帧是noise(target)
+        x_mod = torch.cat([x_cond_noise, x_mod], dim=1)
         gt_cond = cond 
-        # 传给 scorenet 的 cond 设为 None (因为已经拼在 input 里了)
-        cond = None 
+        cond = None # 告诉 scorenet 已经在 x 里面拼好了
     else:
         gt_cond = None
 
@@ -247,58 +220,39 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
         alpha_cumprod_prev_t = alphas_cumprod_prev[step_idx]
         alpha_t = alpha_cumprod_t / alpha_cumprod_prev_t
 
-        # --- 2. Replacement (Inpainting) Step ---
+        # --- Replacement Step (强制修正 Past 部分) ---
         if gt_cond is not None:
-            # 计算当前步对应的 GT Noisy Past
-            # q(x_t | x_0) = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * eps
             noise = torch.randn_like(gt_cond)
-            
-            # 注意: alpha_cumprod_t 是 scalar，直接乘可能会导致 batch 维度广播问题
-            # 显式 reshape alpha 以确保安全
             alpha_t_shaped = alpha_cumprod_t.view(-1, 1, 1, 1)
-            
             noisy_cond_t = torch.sqrt(alpha_t_shaped) * gt_cond + torch.sqrt(1 - alpha_t_shaped) * noise
             
-            # 显式切片：替换后半部分 (Past)
-            # x_mod: [0...n_future-1] 是 Future
-            # x_mod: [n_future...end] 是 Past
-            
-            # Debug check (只在第一步检查)
-            if i == 0:
-                target_slice_shape = x_mod[:, n_future:].shape
-                source_shape = noisy_cond_t.shape
-                if target_slice_shape != source_shape:
-                    print(f"ERROR: Shape mismatch in Replacement!")
-                    print(f"Target slice (x_mod[:, {n_future}:]): {target_slice_shape}")
-                    print(f"Source (noisy_cond_t): {source_shape}")
-                    raise RuntimeError("Dimension mismatch in ddpm_sampler replacement step")
+            # --- 修正逻辑 2: 替换前 n_past 帧 ---
+            # 因为顺序是 [Past, Future]，所以我们替换 [:n_past]
+            x_mod[:, :n_past] = noisy_cond_t
 
-            x_mod[:, n_future:] = noisy_cond_t
+        # --- Predict ---
+        grad = scorenet_fn(x_mod, t) 
+        
+        # --- Monitor Norms ---
+        if verbose and i % 100 == 0:
+            grad_norm = torch.norm(grad.reshape(grad.shape[0], -1), dim=-1).mean().item()
+            image_norm = torch.norm(x_mod.reshape(x_mod.shape[0], -1), dim=-1).mean().item()
+            print(f"Step {step_idx}/{num_timesteps} | Grad Norm: {grad_norm:.4f} | Image Norm: {image_norm:.4f}")
 
-        # Predict
-        grad = scorenet_fn(x_mod, t)
-        
-        # Predict x0
-        # x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
-        
-        # 再次确保 alpha 维度安全
+        # --- Predict x0 ---
         sqrt_recip_alpha_bar = torch.sqrt(1. / alpha_cumprod_t).view(-1, 1, 1, 1)
         sqrt_recip_m1_alpha_bar = torch.sqrt(1. / alpha_cumprod_t - 1.).view(-1, 1, 1, 1)
-        
         pred_x0 = sqrt_recip_alpha_bar * x_mod - sqrt_recip_m1_alpha_bar * grad
         
         if clip_before:
             pred_x0 = pred_x0.clamp(-1., 1.)
             
-        # Compute Mean (Posterior Mean)
-        # mu_t = coeff1 * x0 + coeff2 * xt
-        
+        # --- Compute Mean ---
         coeff_x0 = ((beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
         coeff_xt = (((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
-        
         mean = coeff_x0 * pred_x0 + coeff_xt * x_mod
 
-        # Add Noise (Posterior Variance)
+        # --- Add Noise ---
         if step_idx > 0:
             if same_noise:
                 noise = noise_val
@@ -307,19 +261,17 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
             
             sigma_t_sq = ((1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t)) * beta_t
             sigma_t = torch.sqrt(sigma_t_sq + 1e-10).view(-1, 1, 1, 1)
-            
             x_mod = mean + sigma_t * noise
         else:
             x_mod = mean
-            
-        if verbose and i % 100 == 0:
-            print(f"Sampling step {step_idx}...")
 
-    # 返回时，只返回预测部分 (Future)
+    # --- 修正逻辑 3: 返回结果 ---
+    # 我们只想要 Future 部分，即 [n_past:]
     if final_only:
-        return x_mod[:, :n_future].unsqueeze(0)
+        return x_mod[:, n_past:].unsqueeze(0)
     else:
-        return torch.stack(images)
+        # 这里为了简化，只返回 final
+        return torch.stack(images) if len(images) > 0 else x_mod[:, n_past:].unsqueeze(0)
 
 
 @torch.no_grad()

@@ -11,6 +11,11 @@ uv run python train.py --log_dir /home/lijy/workspace/video-diff-worldmodel/logs
  --save_interval 10 --batch_size 64 --num_workers 4 \
  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST
 
+
+uv run python train.py --log_dir /data/biolab-nvme-pcie2/lijy/video-diff-ckpt/mnist_experiment_debug_cosine \
+ --save_interval 10 --batch_size 64 --num_workers 4 \
+ --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST
+
 # ================== TESTING SCRIPTS ==================
 
 uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment/ckpt_epoch_40.pt \
@@ -38,4 +43,5 @@ uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/log
 uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_linear_joint/latest.pt \
  --output_dir ./outputs/mnist_experiment_vis_debug_linear_joint/ \
  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
- --num_samples 2
+ --temperature 0.9 \
+ --num_samples 5

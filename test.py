@@ -24,6 +24,7 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='./results', help='Where to save visualizations')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of video samples to generate')
     parser.add_argument('--data_path', type=str, help='Path to Moving MNIST data')
+    parser.add_argument('--temperature', type=float,default=1.0, help='Sampler temperature')
     return parser.parse_args()
 
 def save_gif(frames_tensor, path, fps=4):
@@ -66,11 +67,6 @@ def main():
     config = Config()
     device = config.device
     
-    # 强制覆盖 Config 以确保一致性 (Linear Schedule)
-    config.model.sigma_dist = 'linear'
-    config.model.sigma_begin = 1e-4
-    config.model.sigma_end = 0.02
-    
     os.makedirs(args.output_dir, exist_ok=True)
     
     # 1. Load Data (Test Set)
@@ -86,11 +82,38 @@ def main():
     
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     
-    # --- 重要修改：本次测试暂时禁用 EMA ---
-    # 原因：如果训练步数较少(12k)，EMA 可能还包含初始化时的偏差。
-    # 我们先看 Base Model 的表现。如果 Base Model 好但 EMA 坏，说明 EMA 衰减率需要调整。
-    logging.info("Loading base model state (Skipping EMA for debug)...")
+    # [修改后代码] 请完全替换为以下内容：
+    logging.info(f"Loading EMA model state from {args.ckpt_path}...")
+    # 1. 先加载原始权重以防万一
     scorenet.load_state_dict(checkpoint['model_state'])
+
+    # 2. 尝试加载 EMA 权重
+    if 'ema_state' in checkpoint:
+        logging.info("Found EMA state, loading into model...")
+        ema_shadow = checkpoint['ema_state']
+        #以此将 EMA 权重复制到当前模型中
+        #注意：你的 EMAHelper 存储的是 shadow 参数，我们需要手动赋值给 scorenet
+        #这里必须处理 DataParallel 的 module 前缀问题
+        
+        net = scorenet.module if hasattr(scorenet, 'module') else scorenet
+        
+        # 遍历模型参数并赋值
+        missed_keys = []
+        for name, param in net.named_parameters():
+            if param.requires_grad:
+                if name in ema_shadow:
+                    # 直接将 EMA 的数据拷贝到模型参数中
+                    param.data.copy_(ema_shadow[name].data)
+                else:
+                    missed_keys.append(name)
+        
+        if missed_keys:
+            logging.warning(f"EMA keys missed: {missed_keys}")
+        else:
+            logging.info("EMA weights loaded successfully!")
+    else:
+        logging.warning("No EMA state found in checkpoint! Using base model (Results might be poor).")
+
     scorenet.eval()
     
     # 3. Inference Loop
@@ -113,11 +136,7 @@ def main():
         # 这能告诉我们模型是否对当前样本过拟合，或者是否根本没见过这种数据
         test_loss = calc_test_loss(scorenet, config, x_target, cond_tensor)
         print(f"\n[Sample {i}] Test Loss (MSE): {test_loss:.5f}")
-        
-        if test_loss > 0.05:
-            print("WARNING: Test Loss is high! Model generalization issue.")
-        elif test_loss < 0.005:
-            print("WARNING: Test Loss is suspiciously low! Potential data leakage or background overfitting.")
+
             
         # --- Sampling ---
         x_init = torch.randn(1, n_pred*C, H, W).to(device)
@@ -130,7 +149,7 @@ def main():
             scorenet, 
             cond=cond_tensor, 
             subsample_steps=None, # default 1000
-            temperature=1.0,     # 尝试 0.7 或 0.5
+            temperature=args.temperature,     # 尝试 0.7 或 0.5
             final_only=True, 
             denoise=False,      # 必须 False
             clip_before=True,   # 必须 True (x0 clipping)
@@ -156,13 +175,13 @@ def main():
         
         # Compare GIF
         combined_gif_frames = torch.cat([seq_gt, seq_pred], dim=3)
-        gif_path = os.path.join(args.output_dir, f'sample_{i}_loss_{test_loss:.4f}.gif')
+        gif_path = os.path.join(args.output_dir, f'sample_{i}_loss_{test_loss:.4f}_t{args.temperature:.2f}.gif')
         save_gif(combined_gif_frames, gif_path)
         
         # Grid
         grid_tensor = torch.cat([seq_gt, seq_pred], dim=0) 
         grid_img = make_grid(grid_tensor, nrow=15, padding=2, pad_value=1.0)
-        save_image(grid_img, os.path.join(args.output_dir, f'sample_{i}_grid.png'))
+        save_image(grid_img, os.path.join(args.output_dir, f'sample_{i}_grid_t{args.temperature:.2f}.png'))
 
     logging.info("Testing complete.")
 
