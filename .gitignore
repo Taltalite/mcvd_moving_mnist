@@ -9,3 +9,5 @@ data/
 *.h5
 *.log
 *.csv
+
+*.onnx

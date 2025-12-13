@@ -173,19 +173,77 @@ def ddim_sampler(x_mod, scorenet, cond=None, final_only=False, denoise=True, sub
         return torch.stack(images)
 
 
+# @torch.no_grad()
+# def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, denoise=True, subsample_steps=None,
+#                  same_noise=False, noise_val=None, frac_steps=None, verbose=False, log=False, clip_before=True, 
+#                  t_min=-1, gamma=False, temperature=1.0, **kwargs):
+
+#     net = scorenet.module if hasattr(scorenet, 'module') else scorenet
+#     betas = net.betas
+#     alphas_cumprod = net.alphas
+#     alphas_cumprod_prev = net.alphas_prev
+#     num_timesteps = len(betas)
+#     steps = list(range(num_timesteps))[::-1]
+    
+#     if subsample_steps is not None:
+#         skip = num_timesteps // subsample_steps
+#         steps = steps[::skip]
+
+#     images = []
+#     scorenet_fn = partial(scorenet, cond=cond)
+
+#     for i, step_idx in enumerate(steps):
+#         t = torch.full((x_mod.shape[0],), step_idx, device=x_mod.device, dtype=torch.long)
+        
+#         beta_t = betas[step_idx]
+#         alpha_cumprod_t = alphas_cumprod[step_idx]
+#         alpha_cumprod_prev_t = alphas_cumprod_prev[step_idx]
+#         alpha_t = alpha_cumprod_t / alpha_cumprod_prev_t
+
+#         grad = scorenet_fn(x_mod, t) 
+
+#         sqrt_recip_alpha_bar = torch.sqrt(1. / alpha_cumprod_t).view(-1, 1, 1, 1)
+#         sqrt_recip_m1_alpha_bar = torch.sqrt(1. / alpha_cumprod_t - 1.).view(-1, 1, 1, 1)
+#         pred_x0 = sqrt_recip_alpha_bar * x_mod - sqrt_recip_m1_alpha_bar * grad
+        
+#         if clip_before:
+#             pred_x0 = pred_x0.clamp(-1., 1.)
+
+#         coeff_x0 = ((beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
+#         coeff_xt = (((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
+#         mean = coeff_x0 * pred_x0 + coeff_xt * x_mod
+
+#         if step_idx > 0:
+#             noise = torch.randn_like(x_mod) * temperature
+#             sigma_t_sq = ((1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t)) * beta_t
+#             sigma_t = torch.sqrt(sigma_t_sq + 1e-10).view(-1, 1, 1, 1)
+#             x_mod = mean + sigma_t * noise
+#         else:
+#             x_mod = mean
+#     if final_only:
+#         return x_mod.unsqueeze(0)
+#     else:
+#         return torch.stack(images) if len(images) > 0 else x_mod.unsqueeze(0)
+
 @torch.no_grad()
 def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, denoise=True, subsample_steps=None,
                  same_noise=False, noise_val=None, frac_steps=None, verbose=False, log=False, clip_before=True, 
                  t_min=-1, gamma=False, temperature=1.0, **kwargs):
-
+    """
+    Standard DDPM Sampler with Hard Clipping.
+    Optimized for MNIST-like datasets where strict range [-1, 1] is required.
+    """
     net = scorenet.module if hasattr(scorenet, 'module') else scorenet
     betas = net.betas
     alphas_cumprod = net.alphas
     alphas_cumprod_prev = net.alphas_prev
     num_timesteps = len(betas)
+    
+    # 倒序采样：从 T-1 到 0
     steps = list(range(num_timesteps))[::-1]
     
     if subsample_steps is not None:
+        # 如果需要跳步（加速），均匀切分
         skip = num_timesteps // subsample_steps
         steps = steps[::skip]
 
@@ -193,33 +251,55 @@ def ddpm_sampler(x_mod, scorenet, cond=None, just_beta=False, final_only=False, 
     scorenet_fn = partial(scorenet, cond=cond)
 
     for i, step_idx in enumerate(steps):
+        # 1. 构造时间步 t
         t = torch.full((x_mod.shape[0],), step_idx, device=x_mod.device, dtype=torch.long)
         
+        # 2. 获取参数
         beta_t = betas[step_idx]
         alpha_cumprod_t = alphas_cumprod[step_idx]
         alpha_cumprod_prev_t = alphas_cumprod_prev[step_idx]
         alpha_t = alpha_cumprod_t / alpha_cumprod_prev_t
 
+        # 3. 预测噪声 epsilon
         grad = scorenet_fn(x_mod, t) 
 
-        sqrt_recip_alpha_bar = torch.sqrt(1. / alpha_cumprod_t).view(-1, 1, 1, 1)
-        sqrt_recip_m1_alpha_bar = torch.sqrt(1. / alpha_cumprod_t - 1.).view(-1, 1, 1, 1)
+        # 4. 预测 x0 (Reconstruction)
+        # Formula: x0 = (xt - sqrt(1-alpha_bar) * eps) / sqrt(alpha_bar)
+        sqrt_recip_alpha_bar = torch.rsqrt(alpha_cumprod_t)
+        sqrt_recip_m1_alpha_bar = torch.sqrt(1. / alpha_cumprod_t - 1.)
         pred_x0 = sqrt_recip_alpha_bar * x_mod - sqrt_recip_m1_alpha_bar * grad
         
+        # --- 关键修正：必须使用硬截断 (Hard Clipping) ---
+        # 对于 MNIST，必须强制把数值拉回 [-1, 1]，否则背景会发灰
         if clip_before:
             pred_x0 = pred_x0.clamp(-1., 1.)
 
-        coeff_x0 = ((beta_t * torch.sqrt(alpha_cumprod_prev_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
-        coeff_xt = (((1 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t)) / (1 - alpha_cumprod_t)).view(-1, 1, 1, 1)
+        # 5. 计算后验均值 (Posterior Mean)
+        # mu_t = (beta_t * sqrt(alpha_bar_prev) / (1-alpha_bar)) * x0 + 
+        #        ((1-alpha_bar_prev) * sqrt(alpha_t) / (1-alpha_bar)) * xt
+        coeff_x0 = (beta_t * torch.sqrt(alpha_cumprod_prev_t) / (1.0 - alpha_cumprod_t))
+        coeff_xt = ((1.0 - alpha_cumprod_prev_t) * torch.sqrt(alpha_t) / (1.0 - alpha_cumprod_t))
         mean = coeff_x0 * pred_x0 + coeff_xt * x_mod
 
+        # 6. 加入噪声 (Langevin Step)
         if step_idx > 0:
+            # 计算后验方差 (Posterior Variance)
+            # sigma^2 = beta * (1 - alpha_bar_prev) / (1 - alpha_bar)
+            posterior_variance = beta_t * (1.0 - alpha_cumprod_prev_t) / (1.0 - alpha_cumprod_t)
+            
+            # log var trick for stability: 0.5 * log(var)
+            # 加上 1e-20 防止 log(0)
+            posterior_log_variance_clipped = torch.log(posterior_variance.clamp(min=1e-20))
+            
             noise = torch.randn_like(x_mod) * temperature
-            sigma_t_sq = ((1 - alpha_cumprod_prev_t) / (1 - alpha_cumprod_t)) * beta_t
-            sigma_t = torch.sqrt(sigma_t_sq + 1e-10).view(-1, 1, 1, 1)
-            x_mod = mean + sigma_t * noise
+            
+            # 使用对数方差来乘，数值更稳定
+            sigma = torch.exp(0.5 * posterior_log_variance_clipped)
+            x_mod = mean + sigma * noise
         else:
+            # 最后一步不加噪声
             x_mod = mean
+
     if final_only:
         return x_mod.unsqueeze(0)
     else:

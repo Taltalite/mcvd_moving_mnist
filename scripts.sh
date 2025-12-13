@@ -52,16 +52,39 @@ uv run python test.py --ckpt_path /home/lijy/workspace/video-diff-worldmodel/log
  --num_samples 5
 
 uv run python test.py \
-  --ckpt_path /data/biolab-nvme-pcie2/lijy/video-diff-ckpt/mnist_experiment_debug_cosine_2/latest.pt \
+  --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/ckpt_epoch_400.pt \
   --output_dir ./outputs/mnist_experiment_debug_cosine_2 \
   --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
-  --temperature 0.8 \
+  --temperature 0.9 \
+  --num_samples 20
+
+
+uv run python test.py \
+  --ckpt_path /data/biolab-nvme-pcie2/lijy/video-diff-ckpt/mnist_experiment_debug_cosine_2/ckpt_epoch_500.pt \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_1e-6 \
+  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
+  --temperature 0.9 \
+  --num_samples 5
+
+uv run python test.py \
+  --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/val_best_perf.pt \
+  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_smooth \
+  --temperature 1.0 \
+  --num_samples 5
+
+
+uv run python test.py \
+  --ckpt_path /data/biolab-nvme-pcie2/lijy/video-diff-ckpt/mnist_experiment_debug_cosine_2/ckpt_epoch_500.pt \
+  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_aggr \
+  --temperature 1.0 \
   --num_samples 3
 
 
 uv run python test.py \
-  --ckpt_path /data/biolab-nvme-pcie2/lijy/video-diff-ckpt/mnist_experiment_debug_cosine_2/ckpt_epoch_480.pt \
-  --output_dir ./outputs/mnist_experiment_debug_cosine_2 \
+  --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/latest.pt \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_smooth \
   --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
-  --temperature 1.0 \
-  --num_samples 3
+  --temperature 0.9 \
+  --num_samples 30

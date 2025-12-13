@@ -164,13 +164,12 @@ def main():
     
     optimizer = get_optimizer(config, scorenet.parameters())
 
-    # --- 新增：定义自动化调度器 ---
+    # --- 定义自动化调度器 ---
     # mode='min': 监测 Loss 是否变小
     # factor=0.5: 每次触发时，学习率变为原来的 0.5 倍
-    # patience=10: 如果连续 10 次验证 (Validation) Loss 都没有变好，就触发降准
-    # verbose=True: 触发时打印日志
+    # patience=30: 如果连续 30 次验证 (Validation) Loss 都没有变好，就触发降准
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=40, min_lr=1e-6
+        optimizer, mode='min', factor=0.5, patience=25, min_lr=2e-6
     )
     # ---------------------------
 
@@ -182,6 +181,9 @@ def main():
     latest_ckpt_path = os.path.join(args.log_dir, 'latest.pt')
     
     train_loss_hist, val_loss_hist, lr_hist = [], [], []
+
+    best_val_loss = float('inf')
+    best_ckpt_path = os.path.join(args.log_dir, 'val_best_perf.pt')
     
     if os.path.exists(latest_ckpt_path):
         logging.info(f"Resuming from {latest_ckpt_path}")
@@ -195,6 +197,11 @@ def main():
             train_loss_hist = ckpt.get('train_loss_hist', [])
             val_loss_hist = ckpt.get('val_loss_hist', [])
             lr_hist = ckpt.get('lr_hist', [])
+            # 不管 checkpoint 里存的是多少 (比如 1e-6)，我们都强制覆盖为 config 里的值
+            logging.info(f"Overriding optimizer LR to config value: {config.optim.lr}")
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = config.optim.lr
+            # ----------------------------------------------------
         except Exception as e:
             logging.warning(f"Failed to load checkpoint: {e}. Starting from scratch.")
 
@@ -249,6 +256,7 @@ def main():
         logging.info("Running Validation...")
         avg_val_loss = validate(scorenet, val_loader, config)
         val_loss_hist.append(avg_val_loss)
+        
 
         # --- 新增：告诉调度器当前的 Validation Loss ---
         # 如果还在 Warmup 期间，不要让 Scheduler 介入（防止过早衰减）
@@ -276,6 +284,12 @@ def main():
             'val_loss_hist': val_loss_hist,
             'lr_hist': lr_hist
         }
+        # --- 保存 val loss 最优的模型 ---
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(states, best_ckpt_path)
+            logging.info(f"[BEST] New best val loss: {best_val_loss:.6f}. Saving to {best_ckpt_path}")
+        
         torch.save(states, latest_ckpt_path)
         
         if (epoch + 1) % args.save_interval == 0:

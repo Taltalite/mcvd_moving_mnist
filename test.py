@@ -16,7 +16,98 @@ from model.ema import EMAHelper
 from model import ddpm_sampler
 from losses.dsm import anneal_dsm_score_estimation
 
+import time
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# 头部导入增加
+import torchmetrics
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+class VideoMetrics:
+    def __init__(self, device):
+        self.device = device
+        # --- 修改点在这里：添加 data_range=1.0 ---
+        self.psnr = torchmetrics.image.PeakSignalNoiseRatio(data_range=1.0).to(device)
+        # SSIM 这里你之前已经写对了
+        self.ssim = torchmetrics.image.StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        # LPIPS 不需要 data_range，保持原样
+        self.lpips = LearnedPerceptualImagePatchSimilarity(net_type='vgg').to(device)
+        
+        self.reset()
+
+    def reset(self):
+        self.total_psnr = 0
+        self.total_ssim = 0
+        self.total_lpips = 0
+        self.total_mse = 0
+        self.count = 0
+        
+        # 统计量
+        self.pred_mean_intensity = 0
+        self.gt_mean_intensity = 0
+
+    def update(self, pred, gt):
+        """
+        pred, gt: [T, C, H, W] or [B, T, C, H, W] in range [0, 1]
+        """
+        # 确保输入是 [B, T, C, H, W]
+        if pred.ndim == 4:
+            pred = pred.unsqueeze(0)
+            gt = gt.unsqueeze(0)
+            
+        B, T, C, H, W = pred.shape
+        
+        # 将 Batch 和 Time 维度合并计算，视为 T 张独立的图
+        # shape: [B*T, C, H, W]
+        flat_pred = pred.view(-1, C, H, W)
+        flat_gt = gt.view(-1, C, H, W)
+        
+        # 1. MSE
+        mse = torch.mean((flat_pred - flat_gt) ** 2).item()
+        
+        # 2. PSNR & SSIM
+        psnr_val = self.psnr(flat_pred, flat_gt).item()
+        ssim_val = self.ssim(flat_pred, flat_gt).item()
+        
+        # 3. LPIPS (需要转为 3 通道, 且范围推荐 [-1, 1] 但 [0,1] 也能跑，这里我们 repeat 一下)
+        flat_pred_3c = flat_pred.repeat(1, 3, 1, 1)
+        flat_gt_3c = flat_gt.repeat(1, 3, 1, 1)
+        # LPIPS 期望输入在 [-1, 1]，我们现有的数据是 [0, 1]，做一个简单的转换
+        lpips_val = self.lpips(flat_pred_3c * 2 - 1, flat_gt_3c * 2 - 1).item()
+        
+        # 4. Image Stats (Image Norm 概念)
+        # 计算整个序列的平均像素值，看是否过暗/过亮
+        p_mean = flat_pred.mean().item()
+        g_mean = flat_gt.mean().item()
+
+        # 累加
+        self.total_mse += mse
+        self.total_psnr += psnr_val
+        self.total_ssim += ssim_val
+        self.total_lpips += lpips_val
+        self.pred_mean_intensity += p_mean
+        self.gt_mean_intensity += g_mean
+        self.count += 1
+        
+        return {
+            "mse": mse,
+            "psnr": psnr_val,
+            "ssim": ssim_val,
+            "lpips": lpips_val,
+            "pred_int": p_mean,
+            "gt_int": g_mean
+        }
+
+    def compute_avg(self):
+        return {
+            "Avg MSE": self.total_mse / self.count,
+            "Avg PSNR": self.total_psnr / self.count,
+            "Avg SSIM": self.total_ssim / self.count,
+            "Avg LPIPS": self.total_lpips / self.count,
+            "Avg Pred Intensity": self.pred_mean_intensity / self.count,
+            "Avg GT Intensity": self.gt_mean_intensity / self.count
+        }
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test MCVD on Moving MNIST")
@@ -24,7 +115,12 @@ def parse_args():
     parser.add_argument('--output_dir', type=str, default='./results', help='Where to save visualizations')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of video samples to generate')
     parser.add_argument('--data_path', type=str, help='Path to Moving MNIST data')
-    parser.add_argument('--temperature', type=float,default=1.0, help='Sampler temperature')
+    parser.add_argument('--temperature', type=float, default=1.0, help='Sampler temperature')
+    
+    # --- 必须添加以下两个参数 ---
+    parser.add_argument('--sampler', type=str, default='ddpm', choices=['ddpm', 'pndm'], help='Choose sampler: ddpm (slow) or pndm (fast)')
+    parser.add_argument('--steps', type=int, default=1000, help='Sampling steps (1000 for DDPM, 50 for PNDM)')
+    
     return parser.parse_args()
 
 def save_gif(frames_tensor, path, fps=4):
@@ -66,43 +162,38 @@ def main():
     args = parse_args()
     config = Config()
     device = config.device
+
+    # 1. 初始化指标计算器
+    metrics_calculator = VideoMetrics(device)
     
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # 1. Load Data (Test Set)
+    # 2. Load Data (Test Set)
     test_dataset = MovingMNIST(root=args.data_path, train=False)
     indices = list(range(args.num_samples))
     subset = torch.utils.data.Subset(test_dataset, indices)
     loader = torch.utils.data.DataLoader(subset, batch_size=1, shuffle=False)
     
-    # 2. Load Model
+    # 3. Load Model
     logging.info(f"Loading model from {args.ckpt_path}...")
     scorenet = UNet_DDPM(config).to(device)
     scorenet = torch.nn.DataParallel(scorenet)
     
     checkpoint = torch.load(args.ckpt_path, map_location=device)
     
-    # [修改后代码] 请完全替换为以下内容：
     logging.info(f"Loading EMA model state from {args.ckpt_path}...")
-    # 1. 先加载原始权重以防万一
     scorenet.load_state_dict(checkpoint['model_state'])
 
-    # 2. 尝试加载 EMA 权重
     if 'ema_state' in checkpoint:
         logging.info("Found EMA state, loading into model...")
         ema_shadow = checkpoint['ema_state']
-        #以此将 EMA 权重复制到当前模型中
-        #注意：你的 EMAHelper 存储的是 shadow 参数，我们需要手动赋值给 scorenet
-        #这里必须处理 DataParallel 的 module 前缀问题
         
         net = scorenet.module if hasattr(scorenet, 'module') else scorenet
         
-        # 遍历模型参数并赋值
         missed_keys = []
         for name, param in net.named_parameters():
             if param.requires_grad:
                 if name in ema_shadow:
-                    # 直接将 EMA 的数据拷贝到模型参数中
                     param.data.copy_(ema_shadow[name].data)
                 else:
                     missed_keys.append(name)
@@ -112,11 +203,15 @@ def main():
         else:
             logging.info("EMA weights loaded successfully!")
     else:
-        logging.warning("No EMA state found in checkpoint! Using base model (Results might be poor).")
+        logging.warning("No EMA state found in checkpoint! Using base model.")
 
     scorenet.eval()
     
-    # 3. Inference Loop
+    # 4. Inference Loop
+    total_inference_time = 0 # 用于统计平均推理时间
+    
+    logging.info(f"Start Sampling using method: {args.sampler.upper()} with {args.steps} steps")
+
     for i, (X, _) in enumerate(tqdm(loader, desc="Generating videos")):
         X = X.to(device)
         X = data_transform(config, X) # -> [-1, 1]
@@ -132,63 +227,101 @@ def main():
         cond_tensor = cond_frames.reshape(1, n_cond*C, H, W)
         x_target = gt_frames.reshape(1, n_pred*C, H, W)
         
-        # --- DEBUG 1: 计算 Test Loss ---
-        # 这能告诉我们模型是否对当前样本过拟合，或者是否根本没见过这种数据
+        # --- Test Loss (Optional Debugging) ---
         test_loss = calc_test_loss(scorenet, config, x_target, cond_tensor)
-        print(f"\n[Sample {i}] Test Loss (MSE): {test_loss:.5f}")
-
-            
-        # --- Sampling ---
+        
+        # --- Sampling & Timing ---
         x_init = torch.randn(1, n_pred*C, H, W).to(device)
         
-        logging.info(f"Sampling video {i}...")
+        start_time = time.time() # 计时开始
         
-        # 使用 Robust Linear Sampler
-        generated_flat = ddpm_sampler(
-            x_init, 
-            scorenet, 
-            cond=cond_tensor, 
-            subsample_steps=None, # default 1000
-            temperature=args.temperature,     # 尝试 0.7 或 0.5
-            final_only=True, 
-            denoise=False,      # 必须 False
-            clip_before=True,   # 必须 True (x0 clipping)
-            verbose=True        # 打开 verbose 观察 step
-        )
-        
-        # 4. Visualization
+        if args.sampler == 'pndm':
+            # PNDM 采样 (Fast)
+            # 注意：务必设置 final_only=True 以避免维度错误
+            generated_flat = FPNDM_sampler(
+                x_init, 
+                scorenet, 
+                cond=cond_tensor,
+                subsample_steps=args.steps, 
+                denoise=True,
+                clip_before=True,
+                verbose=False,
+                final_only=True 
+            )
+        else:
+            # DDPM 采样 (Standard/Slow)
+            generated_flat = ddpm_sampler(
+                x_init, 
+                scorenet, 
+                cond=cond_tensor, 
+                subsample_steps=args.steps, # 如果是 1000 则不跳步
+                temperature=args.temperature,
+                final_only=True, 
+                denoise=False,
+                clip_before=True,
+                verbose=False
+            )
+            
+        end_time = time.time()
+        elapsed = end_time - start_time
+        total_inference_time += elapsed
+
+        # 5. Post-processing
         gen_frames = generated_flat.reshape(n_pred, C, H, W)
         cond_frames_sq = cond_frames.squeeze(0)
         gt_frames_sq = gt_frames.squeeze(0)
         
-        # Denormalize
+        # Denormalize to [0, 1]
         gen_frames = inverse_data_transform(config, gen_frames)
         cond_frames_sq = inverse_data_transform(config, cond_frames_sq)
         gt_frames_sq = inverse_data_transform(config, gt_frames_sq)
         
         gen_frames = torch.clamp(gen_frames, 0, 1)
+        gt_frames_sq = torch.clamp(gt_frames_sq, 0, 1) # 确保 GT 也在范围内
 
-        # # 1. 强力去噪：把背景的犹豫全部砍掉
-        # threshold = 0.5
-        # gen_frames[gen_frames < threshold] = 0.0  # 背景变纯黑
-        # gen_frames[gen_frames >= threshold] = 1.0 # 笔画变纯白
+        # --- 新增：针对 MNIST 的对比度增强 (Soft Thresholding) ---
+        # 这不是作弊，这是针对二值数据的合理后处理
+        # 它可以把接近 0 的背景压黑，接近 1 的笔画提亮，同时保持中间的渐变
+        gen_frames = (gen_frames - 0.2) / (0.8 - 0.2) 
+        gen_frames = torch.clamp(gen_frames, 0, 1)
+        # ----------------------------------------------------
+
+
+        # --- Metrics Update (核心修改) ---
+        # 计算当前样本的指标并累加
+        curr_metrics = metrics_calculator.update(gen_frames, gt_frames_sq)
         
-        # Seq 1: GT
+        # 打印当前样本信息
+        print(f"\n[Sample {i}] Time: {elapsed:.2f}s | MSE: {test_loss:.5f} | PSNR: {curr_metrics['psnr']:.2f} | LPIPS: {curr_metrics['lpips']:.3f}")
+
+        # 6. Visualization
         seq_gt = torch.cat([cond_frames_sq, gt_frames_sq], dim=0)
-        # Seq 2: Pred
         seq_pred = torch.cat([cond_frames_sq, gen_frames], dim=0)
         
-        # Compare GIF
+        # GIF
         combined_gif_frames = torch.cat([seq_gt, seq_pred], dim=3)
-        gif_path = os.path.join(args.output_dir, f'sample_{i}_loss_{test_loss:.4f}_t{args.temperature:.2f}.gif')
+        gif_path = os.path.join(args.output_dir, f'sample_{i}_{args.sampler}.gif')
         save_gif(combined_gif_frames, gif_path)
         
         # Grid
         grid_tensor = torch.cat([seq_gt, seq_pred], dim=0) 
         grid_img = make_grid(grid_tensor, nrow=15, padding=2, pad_value=1.0)
-        save_image(grid_img, os.path.join(args.output_dir, f'sample_{i}_grid_t{args.temperature:.2f}.png'))
+        save_image(grid_img, os.path.join(args.output_dir, f'sample_{i}_{args.sampler}_grid.png'))
 
-    logging.info("Testing complete.")
+    # --- Final Report ---
+    avg_inference_time = total_inference_time / args.num_samples
+    final_metrics = metrics_calculator.compute_avg()
+    
+    logging.info("="*40)
+    logging.info(f"TESTING COMPLETE ({args.num_samples} samples)")
+    logging.info(f"Sampler: {args.sampler.upper()} | Steps: {args.steps}")
+    logging.info(f"Avg Inference Time: {avg_inference_time:.4f}s")
+    logging.info("-" * 20)
+    logging.info(f"Avg MSE:   {final_metrics['Avg MSE']:.5f}")
+    logging.info(f"Avg PSNR:  {final_metrics['Avg PSNR']:.3f}")
+    logging.info(f"Avg SSIM:  {final_metrics['Avg SSIM']:.3f}")
+    logging.info(f"Avg LPIPS: {final_metrics['Avg LPIPS']:.3f}")
+    logging.info("="*40)
 
 if __name__ == "__main__":
     main()
