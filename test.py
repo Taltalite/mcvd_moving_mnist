@@ -167,6 +167,11 @@ def main():
         gt_frames_sq = inverse_data_transform(config, gt_frames_sq)
         
         gen_frames = torch.clamp(gen_frames, 0, 1)
+
+        # # 1. 强力去噪：把背景的犹豫全部砍掉
+        # threshold = 0.5
+        # gen_frames[gen_frames < threshold] = 0.0  # 背景变纯黑
+        # gen_frames[gen_frames >= threshold] = 1.0 # 笔画变纯白
         
         # Seq 1: GT
         seq_gt = torch.cat([cond_frames_sq, gt_frames_sq], dim=0)

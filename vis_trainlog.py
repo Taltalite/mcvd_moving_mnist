@@ -72,6 +72,6 @@ def visualize_training_log(csv_file_path, outpath='./'):
 
 # 运行函数
 
-csv_file = r"/home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_linear_joint/training_metrics.csv"
-outpath = r"/home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_linear_joint/"
+csv_file = r"/home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/training_metrics.csv"
+outpath = r"/home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/"
 visualize_training_log(csv_file, outpath=outpath)

@@ -32,7 +32,7 @@ class Config:
         self.model.num_classes = 1000 
         
         # --- CRITICAL CHANGE: LINEAR SCHEDULE ---
-        self.model.sigma_dist = 'cosine'  # 改为 linear
+        self.model.sigma_dist = 'cosine'  
         self.model.sigma_begin = 1e-4     # 标准 DDPM 参数
         self.model.sigma_end = 0.02       # 标准 DDPM 参数
         # ----------------------------------------
@@ -47,7 +47,7 @@ class Config:
         # Training Config
         self.training = type('TrainingConfig', (), {})()
         self.training.batch_size = 64
-        self.training.n_epochs = 400
+        self.training.n_epochs = 500
         self.training.n_iters = 400000
         self.training.snapshot_freq = 5000
         self.training.val_freq = 1000
@@ -58,7 +58,7 @@ class Config:
 
         # Optim Config
         self.optim = type('OptimConfig', (), {})()
-        self.optim.lr = 2e-4
+        self.optim.lr = 2e-4    # 2e-4 for base training, 5e-5 for finetune
         self.optim.weight_decay = 0.000
         self.optim.beta1 = 0.9
         self.optim.amsgrad = False

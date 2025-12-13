@@ -262,7 +262,7 @@ class UNet(nn.Module):
             temb = None
 
         if cond is not None:
-            x = torch.cat([x, cond], dim=1)
+            x = torch.cat([cond, x], dim=1)
 
         # if not self.logit_transform and not self.rescaled:
         #     x = 2 * x - 1.
@@ -296,10 +296,10 @@ class UNet(nn.Module):
             n_pred_channels = self.num_frames * self.n_channels
             n_cond_channels = self.num_frames_cond * self.n_channels
             
-            # 因为输入是 [Cond, Target]，输出也是 [Cond, Target]
-            # 所以我们 split 为 [n_cond, n_pred]
-            # 我们只想要后半部分 (Target/Prediction)
-            _, output = torch.split(output, [n_cond_channels, n_pred_channels], dim=1)
+            # 输出也是 [Cond, Target]
+            # 我们只需要 Target 部分 (即 z 的预测)
+            output_cond, output_target = torch.split(output, [n_cond_channels, n_pred_channels], dim=1)
+            output = output_target # 只返回 Target 的预测噪声
             
         return output
 

@@ -163,6 +163,17 @@ def main():
     scorenet = torch.nn.DataParallel(scorenet)
     
     optimizer = get_optimizer(config, scorenet.parameters())
+
+    # --- 新增：定义自动化调度器 ---
+    # mode='min': 监测 Loss 是否变小
+    # factor=0.5: 每次触发时，学习率变为原来的 0.5 倍
+    # patience=10: 如果连续 10 次验证 (Validation) Loss 都没有变好，就触发降准
+    # verbose=True: 触发时打印日志
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=40, min_lr=1e-6
+    )
+    # ---------------------------
+
     ema_helper = EMAHelper(mu=config.model.ema_rate)
     ema_helper.register(scorenet)
     
@@ -200,7 +211,12 @@ def main():
             for X_batch, _ in pbar:
                 optimizer.zero_grad()
                 step += 1
-                current_lr = warmup_lr(optimizer, step, config.optim.warmup, config.optim.lr)
+                # current_lr = warmup_lr(optimizer, step, config.optim.warmup, config.optim.lr)
+                if step < config.optim.warmup:
+                    current_lr = warmup_lr(optimizer, step, config.optim.warmup, config.optim.lr)
+                else:
+                    # 获取当前优化器的 LR 用于记录
+                    current_lr = optimizer.param_groups[0]['lr']
                 
                 X_batch = X_batch.to(config.device)
                 X_batch = data_transform(config, X_batch)
@@ -233,6 +249,12 @@ def main():
         logging.info("Running Validation...")
         avg_val_loss = validate(scorenet, val_loader, config)
         val_loss_hist.append(avg_val_loss)
+
+        # --- 新增：告诉调度器当前的 Validation Loss ---
+        # 如果还在 Warmup 期间，不要让 Scheduler 介入（防止过早衰减）
+        if step >= config.optim.warmup:
+            scheduler.step(avg_val_loss)
+        # -------------------------------------------
         
         logging.info(f"Epoch {epoch} | Train Loss: {avg_train_loss:.5f} | Val Loss: {avg_val_loss:.5f}")
         
@@ -245,6 +267,9 @@ def main():
             'model_state': scorenet.state_dict(),
             'optimizer_state': optimizer.state_dict(),
             'ema_state': ema_helper.state_dict(),
+            # --- 新增：保存调度器状态 ---
+            'scheduler_state': scheduler.state_dict(),
+            # -------------------------
             'epoch': epoch,
             'step': step,
             'train_loss_hist': train_loss_hist,
