@@ -100,6 +100,9 @@ def plot_comparison():
 
     ax1.set_title('Training Dynamics Comparison: Loss & Learning Rate')
 
+    ax1.set_xlim(0,500)
+    ax2.set_xlim(0,500)
+
     # 导出 PNG + PDF（论文更推荐 PDF/SVG）
     fig.savefig('fig_training_overview.png', dpi=300)
     # fig.savefig('fig_training_overview.pdf')

@@ -47,7 +47,7 @@ class Config:
         # Training Config
         self.training = type('TrainingConfig', (), {})()
         self.training.batch_size = 64
-        self.training.n_epochs = 600
+        self.training.n_epochs = 900
         self.training.n_iters = 400000
         self.training.snapshot_freq = 5000
         self.training.val_freq = 1000

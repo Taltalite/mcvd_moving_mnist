@@ -84,7 +84,15 @@ uv run python test.py \
 
 uv run python test.py \
   --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/latest.pt \
-  --output_dir ./outputs/mnist_experiment_debug_cosine_2_smooth \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_smooth_900 \
   --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
-  --temperature 0.9 \
-  --num_samples 30
+  --temperature 1.0 \
+  --num_samples 50
+
+
+uv run python test_sampler.py \
+  --ckpt_path /home/lijy/workspace/video-diff-worldmodel/logs/mnist_experiment_debug_cosine_2/latest.pt \
+  --output_dir ./outputs/mnist_experiment_debug_cosine_2_smooth_900_ddim \
+  --data_path /data/biolab-nvme-pcie2/lijy/MCVD/Datasets/MNIST \
+  --sampler ddim --steps 50 \
+  --num_samples 5
